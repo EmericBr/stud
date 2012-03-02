@@ -108,6 +108,7 @@ stud_config * config_new (void) {
   // set default values
 
   r->ETYPE              = ENC_TLS;
+  r->CLIENT		= 0;
   r->WRITE_IP_OCTET     = 0;
   r->WRITE_PROXY_LINE   = 0;
   r->CHROOT             = NULL;
@@ -763,6 +764,7 @@ void config_print_usage_fd (char *prog, stud_config *cfg, FILE *out) {
   fprintf(out, "\n");
   fprintf(out, "      --tls                   TLSv1 (default)\n");
   fprintf(out, "      --ssl                   SSLv3 (implies no TLSv1)\n");
+  fprintf(out, "      --client                Use client mode (default is server mode)\n");
   fprintf(out, "  -c  --ciphers=SUITE         Sets allowed ciphers (Default: \"%s\")\n", config_disp_str(cfg->CIPHER_SUITE));
   fprintf(out, "  -e  --ssl-engine=NAME       Sets OpenSSL engine (Default: \"%s\")\n", config_disp_str(cfg->ENGINE));
   fprintf(out, "  -O  --prefer-server-ciphers Prefer server list order\n");
@@ -1002,6 +1004,7 @@ void config_print_usage (char *prog, stud_config *cfg) {
 
 void config_parse_cli(int argc, char **argv, stud_config *cfg) {
   static int tls = 0, ssl = 0;
+  static int client = 0;
   int c;
   int test_only = 0;
   char *prog;
@@ -1014,6 +1017,7 @@ void config_parse_cli(int argc, char **argv, stud_config *cfg) {
     
     { "tls", 0, &tls, 1},
     { "ssl", 0, &ssl, 1},    
+    { "client", 0, &client, 1},    
     { CFG_CIPHERS, 1, NULL, 'c' },
     { CFG_PREFER_SERVER_CIPHERS, 0, NULL, 'O' },
     { CFG_BACKEND, 1, NULL, 'b' },
@@ -1147,6 +1151,9 @@ void config_parse_cli(int argc, char **argv, stud_config *cfg) {
       cfg->ETYPE = ENC_TLS;
   }
 
+  if (client)
+      cfg->CLIENT = 1;
+
   if (cfg->WRITE_IP_OCTET && cfg->WRITE_PROXY_LINE)
     config_die("Options --write-ip and --write-proxy are mutually exclusive.");
 
@@ -1165,7 +1172,7 @@ void config_parse_cli(int argc, char **argv, stud_config *cfg) {
   argv += optind;
   if (argv != NULL && argv[0] != NULL)
     config_param_validate(CFG_PEM_FILE, argv[0], cfg, NULL, 0);
-  else if (cfg->CERT_FILE == NULL || strlen(cfg->CERT_FILE) < 1)
+  else if (!client && (cfg->CERT_FILE == NULL || strlen(cfg->CERT_FILE) < 1))
     config_die("No x509 certificate PEM file specified!");
   
   // was this only a test?

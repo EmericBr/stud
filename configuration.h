@@ -29,6 +29,7 @@ typedef enum {
 /* configuration structure */
 struct __stud_config {
     ENC_TYPE ETYPE;
+    int CLIENT;
     int WRITE_IP_OCTET;
     int WRITE_PROXY_LINE;
     char *CHROOT;

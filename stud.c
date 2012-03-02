@@ -541,9 +541,9 @@ SSL_CTX * init_openssl() {
             SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION;
 
     if (CONFIG->ETYPE == ENC_TLS)
-        ctx = SSL_CTX_new(TLSv1_server_method());
+        ctx = CONFIG->CLIENT ? SSL_CTX_new(TLSv1_client_method()) : SSL_CTX_new(TLSv1_server_method());
     else if (CONFIG->ETYPE == ENC_SSL)
-        ctx = SSL_CTX_new(SSLv23_server_method());
+        ctx = CONFIG->CLIENT ? SSL_CTX_new(SSLv23_client_method()) : SSL_CTX_new(SSLv23_server_method());
     else
         assert(CONFIG->ETYPE == ENC_TLS || CONFIG->ETYPE == ENC_SSL);
 
@@ -553,26 +553,6 @@ SSL_CTX * init_openssl() {
 
     SSL_CTX_set_options(ctx, ssloptions);
     SSL_CTX_set_info_callback(ctx, info_callback);
-
-    if (SSL_CTX_use_certificate_chain_file(ctx, CONFIG->CERT_FILE) <= 0) {
-        ERR_print_errors_fp(stderr);
-        exit(1);
-    }
-
-    rsa = load_rsa_privatekey(ctx, CONFIG->CERT_FILE);
-    if(!rsa) {
-       ERR("Error loading rsa private key\n");
-       exit(1);
-    }
-
-    if (SSL_CTX_use_RSAPrivateKey(ctx,rsa) <= 0) {
-        ERR_print_errors_fp(stderr);
-        exit(1);
-    }
-
-#ifndef OPENSSL_NO_DH
-    init_dh(ctx, CONFIG->CERT_FILE);
-#endif /* OPENSSL_NO_DH */
 
     if (CONFIG->ENGINE) {
         ENGINE *e = NULL;
@@ -598,6 +578,29 @@ SSL_CTX * init_openssl() {
 
     if (CONFIG->PREFER_SERVER_CIPHERS)
         SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
+
+    if (CONFIG->CLIENT)
+        return ctx;
+
+    if (SSL_CTX_use_certificate_chain_file(ctx, CONFIG->CERT_FILE) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
+    rsa = load_rsa_privatekey(ctx, CONFIG->CERT_FILE);
+    if(!rsa) {
+       ERR("Error loading rsa private key\n");
+       exit(1);
+    }
+
+    if (SSL_CTX_use_RSAPrivateKey(ctx,rsa) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
+#ifndef OPENSSL_NO_DH
+    init_dh(ctx, CONFIG->CERT_FILE);
+#endif /* OPENSSL_NO_DH */
 
 #ifdef USE_SHARED_CACHE
     if (CONFIG->SHARED_CACHE) {
@@ -685,8 +688,10 @@ static int create_main_socket() {
     }
 
 #if TCP_DEFER_ACCEPT
-    int timeout = 1; 
-    setsockopt(s, IPPROTO_TCP, TCP_DEFER_ACCEPT, &timeout, sizeof(int) );
+    if (!CONFIG->CLIENT) {
+        int timeout = 1; 
+        setsockopt(s, IPPROTO_TCP, TCP_DEFER_ACCEPT, &timeout, sizeof(int) );
+    }
 #endif /* TCP_DEFER_ACCEPT */
 
     prepare_proxy_line(ai->ai_addr);
@@ -1062,6 +1067,31 @@ static void client_write(struct ev_loop *loop, ev_io *w, int revents) {
     }
 }
 
+/* Continue/complete the asynchronous connect() before starting data transmission
+ * between front/backend */
+static void handle_connect_client(struct ev_loop *loop, ev_io *w, int revents) {
+    (void) revents;
+    int t;
+    proxystate *ps = (proxystate *)w->data;
+
+    t = connect(ps->fd_down, backaddr->ai_addr, backaddr->ai_addrlen);
+    if (!t || errno == EISCONN || !errno) {
+        /* INIT */
+        ev_io_stop(loop, &ps->ev_w_up);
+        ev_io_init(&ps->ev_w_up, client_write, ps->fd_down, EV_WRITE);
+        ev_io_init(&ps->ev_r_up, client_read, ps->fd_down, EV_READ);
+        start_handshake(ps, SSL_ERROR_WANT_WRITE); /* for client-first handshake */
+        ev_io_start(loop, &ps->ev_r_down);
+    }
+    else if (errno == EINPROGRESS || errno == EINTR || errno == EALREADY) {
+        /* do nothing, we'll get phoned home again... */
+    }
+    else {
+        perror("{backend-connect}");
+        shutdown_proxy(ps, SHUTDOWN_HARD);
+    }
+}
+
 /* libev read handler for the bound socket.  Socket is accepted,
  * the proxystate is allocated and initalized, and we're off the races
  * connecting to the backend */
@@ -1156,6 +1186,96 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
     SSL_set_app_data(ssl, ps);
 }
 
+static void handle_accept_client(struct ev_loop *loop, ev_io *w, int revents) {
+    (void) revents;
+    struct sockaddr_storage addr;
+    socklen_t sl = sizeof(addr);
+    int client = accept(w->fd, (struct sockaddr *) &addr, &sl);
+    if (client == -1) {
+        switch (errno) {
+        case EMFILE:
+            ERR("{client} accept() failed; too many open files for this process\n");
+            break;
+
+        case ENFILE:
+            ERR("{client} accept() failed; too many open files for this system\n");
+            break;
+
+        default:
+            assert(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN);
+            break;
+        }
+        return;
+    }
+
+    int flag = 1;
+    int ret = setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag) );
+    if (ret == -1) {
+      perror("Couldn't setsockopt on client (TCP_NODELAY)\n");
+    }
+#ifdef TCP_CWND
+    int cwnd = 10;
+    ret = setsockopt(client, IPPROTO_TCP, TCP_CWND, &cwnd, sizeof(cwnd));
+    if (ret == -1) {
+      perror("Couldn't setsockopt on client (TCP_CWND)\n");
+    }
+#endif
+
+    setnonblocking(client);
+    settcpkeepalive(client);
+
+    int back = create_back_socket();
+
+    if (back == -1) {
+        close(client);
+        perror("{backend-connect}");
+        return;
+    }
+
+    SSL_CTX * ctx = (SSL_CTX *)w->data;
+    SSL *ssl = SSL_new(ctx);
+    long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
+#ifdef SSL_MODE_RELEASE_BUFFERS
+    mode |= SSL_MODE_RELEASE_BUFFERS;
+#endif
+    SSL_set_mode(ssl, mode);
+    SSL_set_connect_state(ssl);
+    SSL_set_fd(ssl, back);
+
+    proxystate *ps = (proxystate *)malloc(sizeof(proxystate));
+
+    ps->fd_up = client;
+    ps->fd_down = back;
+    ps->ssl = ssl;
+    ps->want_shutdown = 0;
+    ps->handshaked = 0;
+    ps->renegotiation = 0;
+    ps->remote_ip = addr;
+    ringbuffer_init(&ps->ring_up);
+    ringbuffer_init(&ps->ring_down);
+
+    /* set up events */
+    ev_io_init(&ps->ev_r_down, back_read, client, EV_READ);
+    ev_io_init(&ps->ev_w_down, back_write, client, EV_WRITE);
+
+    ev_io_init(&ps->ev_r_handshake, client_handshake, back, EV_READ);
+    ev_io_init(&ps->ev_w_handshake, client_handshake, back, EV_WRITE);
+
+    ev_io_init(&ps->ev_w_up, handle_connect_client, back, EV_WRITE);
+    ev_io_init(&ps->ev_r_up, client_read, back, EV_READ);
+
+    ev_io_start(loop, &ps->ev_w_up);
+
+    ps->ev_r_up.data = ps;
+    ps->ev_w_up.data = ps;
+    ps->ev_r_down.data = ps;
+    ps->ev_w_down.data = ps;
+    ps->ev_r_handshake.data = ps;
+    ps->ev_w_handshake.data = ps;
+
+    /* Link back proxystate to SSL state */
+    SSL_set_app_data(ssl, ps);
+}
 
 static void check_ppid(struct ev_loop *loop, ev_timer *w, int revents) {
     (void) revents;
@@ -1197,7 +1317,11 @@ static void handle_connections() {
     ev_timer_init(&timer_ppid_check, check_ppid, 1.0, 1.0);
     ev_timer_start(loop, &timer_ppid_check);
 
-    ev_io_init(&listener, handle_accept, listener_socket, EV_READ);
+    if (!CONFIG->CLIENT)
+        ev_io_init(&listener, handle_accept, listener_socket, EV_READ);
+    else
+        ev_io_init(&listener, handle_accept_client, listener_socket, EV_READ);
+
     listener.data = ssl_ctx;
     ev_io_start(loop, &listener);
 
