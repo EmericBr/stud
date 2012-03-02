@@ -89,6 +89,7 @@ static int listener_socket;
 static int child_num;
 static pid_t *child_pids;
 static SSL_CTX *ssl_ctx;
+static SSL_SESSION *client_session;
 
 #ifdef USE_SHARED_CACHE
 static ev_io shcupd_listener;
@@ -980,6 +981,44 @@ static void client_handshake(struct ev_loop *loop, ev_io *w, int revents) {
     }
 }
 
+/* The libev I/O handler during the OpenSSL handshake phase.  Basically, just
+ * let OpenSSL do what it likes with the socket and obey its requests for reads
+ * or writes */
+static void client_handshake_client(struct ev_loop *loop, ev_io *w, int revents) {
+    (void) revents;
+    int t;
+    proxystate *ps = (proxystate *)w->data;
+
+    t = SSL_do_handshake(ps->ssl);
+    if (t == 1) {
+        if (!SSL_session_reused(ps->ssl)) {
+            if (client_session)
+                SSL_SESSION_free(client_session);
+            client_session = SSL_get1_session(ps->ssl);
+        }
+        end_handshake(ps);
+    }
+    else {
+        int err = SSL_get_error(ps->ssl, t);
+        if (err == SSL_ERROR_WANT_READ) {
+            ev_io_stop(loop, &ps->ev_w_handshake);
+            ev_io_start(loop, &ps->ev_r_handshake);
+        }
+        else if (err == SSL_ERROR_WANT_WRITE) {
+            ev_io_stop(loop, &ps->ev_r_handshake);
+            ev_io_start(loop, &ps->ev_w_handshake);
+        }
+        else if (err == SSL_ERROR_ZERO_RETURN) {
+            LOG("{client} Connection closed (in handshake)\n");
+            shutdown_proxy(ps, SHUTDOWN_UP);
+        }
+        else {
+            LOG("{client} Unexpected SSL error (in handshake): %d\n", err);
+            shutdown_proxy(ps, SHUTDOWN_UP);
+        }
+    }
+}
+
 /* Handle a socket error condition passed to us from OpenSSL */
 static void handle_fatal_ssl_error(proxystate *ps, int err) {
     if (err == SSL_ERROR_ZERO_RETURN)
@@ -1241,6 +1280,8 @@ static void handle_accept_client(struct ev_loop *loop, ev_io *w, int revents) {
     SSL_set_mode(ssl, mode);
     SSL_set_connect_state(ssl);
     SSL_set_fd(ssl, back);
+    if (client_session)
+        SSL_set_session(ssl, client_session);
 
     proxystate *ps = (proxystate *)malloc(sizeof(proxystate));
 
@@ -1258,8 +1299,8 @@ static void handle_accept_client(struct ev_loop *loop, ev_io *w, int revents) {
     ev_io_init(&ps->ev_r_down, back_read, client, EV_READ);
     ev_io_init(&ps->ev_w_down, back_write, client, EV_WRITE);
 
-    ev_io_init(&ps->ev_r_handshake, client_handshake, back, EV_READ);
-    ev_io_init(&ps->ev_w_handshake, client_handshake, back, EV_WRITE);
+    ev_io_init(&ps->ev_r_handshake, client_handshake_client, back, EV_READ);
+    ev_io_init(&ps->ev_w_handshake, client_handshake_client, back, EV_WRITE);
 
     ev_io_init(&ps->ev_w_up, handle_connect_client, back, EV_WRITE);
     ev_io_init(&ps->ev_r_up, client_read, back, EV_READ);
